@@ -3,6 +3,7 @@ date_default_timezone_set('Asia/Tehran');
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../botapi.php';
 require_once __DIR__ . '/../function.php';
+cron_guard();
 $datatextbotget = select("textbot", "*",null ,null ,"fetchAll");
 $datatxtbot = array();
 foreach ($datatextbotget as $row) {

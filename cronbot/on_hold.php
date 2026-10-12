@@ -5,6 +5,7 @@ require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../botapi.php';
 require_once __DIR__ . '/../panels.php';
 require_once __DIR__ . '/../function.php';
+cron_guard();
 $ManagePanel = new ManagePanel();
 
 $setting = select("setting", "*");

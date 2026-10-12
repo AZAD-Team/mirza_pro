@@ -31,11 +31,22 @@ foreach ($datatxtbot as $item) {
 }
 $textbotlang = languagechange('../text.json');
 $data = json_decode(file_get_contents("php://input"),true);
-if(isset($data['payment_status']) && $data['payment_status'] == "finished"){
+if(isset($data['payment_status']) && $data['payment_status'] == "finished" && !empty($data['payment_id'])){
 $pay = StatusPayment($data['payment_id']);
+// Trust the status obtained directly from the gateway, not the posted body,
+// so a forged callback cannot credit an order without a real finished payment.
+if(!is_array($pay) || !isset($pay['payment_status']) || !in_array($pay['payment_status'], ['finished','confirmed'], true) || empty($pay['invoice_id'])){
+    return;
+}
 $Payment_report = select("Payment_report","*","dec_not_confirmed",$pay['invoice_id'],"select");
 if($Payment_report){
 if ($Payment_report['payment_Status'] == "paid")return;
+// make sure the amount actually paid is not short of the invoice price
+$actuallyPaid = isset($pay['actually_paid']) ? (float)$pay['actually_paid'] : 0;
+$payAmount = isset($pay['pay_amount']) ? (float)$pay['pay_amount'] : 0;
+if($payAmount > 0 && $actuallyPaid > 0 && ($actuallyPaid + 1e-8) < ($payAmount * 0.98)){
+    return;
+}
 DirectPayment($Payment_report['id_order'],"../images.jpg");
 $pricecashback = select("PaySetting", "ValuePay", "NamePay", "cashbacknowpayment","select")['ValuePay'];
 $Balance_id = select("user","*","id",$Payment_report['id_user'],"select");

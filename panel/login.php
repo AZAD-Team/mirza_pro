@@ -1,5 +1,20 @@
 <?php
-ini_set('session.cookie_httponly', true);
+$secureCookie = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+if (PHP_VERSION_ID >= 70300) {
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path' => '/',
+        'httponly' => true,
+        'secure' => $secureCookie,
+        'samesite' => 'Lax',
+    ]);
+} else {
+    ini_set('session.cookie_httponly', '1');
+    if ($secureCookie) {
+        ini_set('session.cookie_secure', '1');
+    }
+}
 session_start();
 session_regenerate_id(true);
 require_once __DIR__ . '/../config.php';
@@ -9,22 +24,62 @@ $allowed_ips = select("setting","*",null,null,"select");
 
 $user_ip = $_SERVER['REMOTE_ADDR'];
 $admin_ids = select("admin", "id_admin", null, null, "FETCH_COLUMN");
-$check_ip = $allowed_ips['iplogin'] == $user_ip ? true : false;
+$check_ip = (!empty($allowed_ips['iplogin']) && $allowed_ips['iplogin'] === $user_ip) ? true : false;
 $texterrr = "";
 $_SESSION["user"] = null;
-if (isset($_POST['login'])) {
-    $username = htmlspecialchars($_POST['username'], ENT_QUOTES, 'UTF-8');
-    $password = htmlspecialchars($_POST['password'], ENT_QUOTES, 'UTF-8');
-    $query = $pdo->prepare("SELECT * FROM admin WHERE username=:username");
-    $query->bindParam("username", $username, PDO::PARAM_STR);
-    $query->execute();
-    $result = $query->fetch(PDO::FETCH_ASSOC);
 
-    if ( !$result ) {
-        $texterrr = 'نام کاربری یا رمزعبور وارد شده اشتباه است!';
+/**
+ * Best-effort login throttle keyed by client IP. Keeps brute-force attempts
+ * low even if the IP allow-list is misconfigured; failures to read/write the
+ * state never block a legitimate login.
+ */
+function panelLoginThrottle($ip, $register)
+{
+    $dir = __DIR__ . '/.throttle';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0700, true);
+    }
+    $file = $dir . '/' . hash('sha256', (string) $ip) . '.json';
+    $now = time();
+    $window = 900; // 15 minutes
+    $maxAttempts = 10;
+    $state = ['count' => 0, 'first' => $now];
+    $raw = @file_get_contents($file);
+    if ($raw !== false) {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded) && isset($decoded['count'], $decoded['first'])) {
+            $state = $decoded;
+        }
+    }
+    if (($now - (int) $state['first']) > $window) {
+        $state = ['count' => 0, 'first' => $now];
+    }
+    if ($register) {
+        $state['count'] = (int) $state['count'] + 1;
+        @file_put_contents($file, json_encode($state), LOCK_EX);
+    }
+    return (int) $state['count'] >= $maxAttempts;
+}
+
+if (isset($_POST['login'])) {
+    if (!$check_ip) {
+        // The login form is only ever shown to an allow-listed IP; reject any
+        // credential submission coming from a different address as well.
+        $texterrr = 'دسترسی از این آیپی مجاز نیست.';
+    } elseif (panelLoginThrottle($user_ip, false)) {
+        $texterrr = 'تلاش‌های ناموفق زیاد بود. چند دقیقه بعد دوباره امتحان کنید.';
     } else {
-                       
-        if ( $password == $result["password"]) {
+        $username = htmlspecialchars($_POST['username'] ?? '', ENT_QUOTES, 'UTF-8');
+        $password = (string) ($_POST['password'] ?? '');
+        $query = $pdo->prepare("SELECT * FROM admin WHERE username=:username");
+        $query->bindParam("username", $username, PDO::PARAM_STR);
+        $query->execute();
+        $result = $query->fetch(PDO::FETCH_ASSOC);
+
+        if ( !$result || !hash_equals((string) $result["password"], $password) ) {
+            panelLoginThrottle($user_ip, true);
+            $texterrr = 'نام کاربری یا رمزعبور وارد شده اشتباه است!';
+        } else {
             foreach ($admin_ids as $admin) {
                 $texts = "کاربر با نام کاربری $username وارد پنل تحت وب شد";
                 sendmessage($admin, $texts, null, 'html');
@@ -32,8 +87,6 @@ if (isset($_POST['login'])) {
             $_SESSION["user"] = $result["username"];
             header('Location: index.php');
             exit;
-        } else {
-            $texterrr =  'رمز صحیح نمی باشد';
         }
     }
 }

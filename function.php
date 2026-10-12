@@ -803,12 +803,67 @@ function outputlunk($text)
 
     curl_close($ch);
 }
+// Rejects URLs whose host resolves to a private, loopback, link-local or
+// otherwise non-public address, so a user-supplied "subscription link" cannot
+// be used to reach the server's own network (SSRF).
+function url_is_public($url)
+{
+    $parts = parse_url((string) $url);
+    if ($parts === false || empty($parts['scheme']) || empty($parts['host'])) {
+        return false;
+    }
+    if (!in_array(strtolower($parts['scheme']), ['http', 'https'], true)) {
+        return false;
+    }
+    $host = $parts['host'];
+    $host = trim($host, '[]'); // IPv6 literal
+    $addresses = [];
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $addresses[] = $host;
+    } else {
+        $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+        if (is_array($records)) {
+            foreach ($records as $record) {
+                if (!empty($record['ip'])) {
+                    $addresses[] = $record['ip'];
+                }
+                if (!empty($record['ipv6'])) {
+                    $addresses[] = $record['ipv6'];
+                }
+            }
+        }
+        $resolved = @gethostbynamel($host);
+        if (is_array($resolved)) {
+            $addresses = array_merge($addresses, $resolved);
+        }
+    }
+    if (empty($addresses)) {
+        return false;
+    }
+    foreach ($addresses as $address) {
+        if (!filter_var(
+            $address,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+        )) {
+            return false;
+        }
+    }
+    return true;
+}
 function outputlunksub($url)
 {
+    if (!url_is_public($url)) {
+        error_log('Refused to fetch non-public subscription URL.');
+        return null;
+    }
     $ch = curl_init();
-    var_dump($url);
     curl_setopt($ch, CURLOPT_URL, "$url/info");
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
+    curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
     $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
     curl_setopt($ch, CURLOPT_USERAGENT, $userAgent);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'GET');
@@ -822,10 +877,10 @@ function outputlunksub($url)
 
     $result = curl_exec($ch);
     if (curl_errno($ch)) {
-        echo 'Error:' . curl_error($ch);
+        error_log('Subscription link fetch error: ' . curl_error($ch));
     }
-    return $result;
     curl_close($ch);
+    return $result;
 }
 function DirectPayment($order_id, $image = 'images.jpg')
 {
@@ -884,7 +939,7 @@ function DirectPayment($order_id, $image = 'images.jpg')
         if ($dataoutput['username'] == null) {
             $dataoutput['msg'] = json_encode($dataoutput['msg']);
             $balance = $Balance_id['Balance'] + $Payment_report['price'];
-            update("user", "Balance", $balance, "id", $Balance_id['id']);
+            balance_add($Balance_id['id'], $Payment_report['price']);
             sendmessage($Balance_id['id'], $textbotlang['users']['sell']['ErrorConfig'], $keyboard, 'HTML');
             sendmessage($Balance_id['id'], "💎  کاربر عزیز بدلیل ساخته نشدن سرویس مبلغ $balance تومان به کیف پول شما اضافه گردید.", $keyboard, 'HTML');
             $texterros = "
@@ -973,7 +1028,7 @@ function DirectPayment($order_id, $image = 'images.jpg')
                     }
                     $Balance_prim = $user_Balance['Balance'] + $result;
                     $dateacc = date('Y/m/d H:i:s');
-                    update("user", "Balance", $Balance_prim, "id", $Balance_id['affiliates']);
+                    balance_add($Balance_id['affiliates'], $result);
                     $result = number_format($result);
                     $textadd = "🎁  پرداخت پورسانت 
         
@@ -1002,7 +1057,7 @@ function DirectPayment($order_id, $image = 'images.jpg')
                 }
                 $Balance_prim = $user_Balance['Balance'] + $result;
                 $dateacc = date('Y/m/d H:i:s');
-                update("user", "Balance", $Balance_prim, "id", $Balance_id['affiliates']);
+                balance_add($Balance_id['affiliates'], $result);
                 $result = number_format($result);
                 $textadd = "🎁  پرداخت پورسانت 
         
@@ -1451,7 +1506,7 @@ $textonebuy
         }
     } else {
         $Balance_confrim = intval($Balance_id['Balance']) + intval($Payment_report['price']);
-        update("user", "Balance", $Balance_confrim, "id", $Payment_report['id_user']);
+        balance_add($Payment_report['id_user'], intval($Payment_report['price']));
         update("Payment_report", "payment_Status", "paid", "id_order", $Payment_report['id_order']);
         $Payment_report['price'] = number_format($Payment_report['price'], 0);
         $format_price_cart = $Payment_report['price'];
@@ -1636,6 +1691,228 @@ function isClientIpInRange($clientIp, $lowerBound, $upperBound)
 
     return strcmp($clientPacked, $lowerPacked) >= 0 && strcmp($clientPacked, $upperPacked) <= 0;
 }
+#-----------webhook / cron authentication helpers------------#
+function webhook_secret_token($token = null)
+{
+    global $APIKEY;
+    $token = ($token === null) ? ($APIKEY ?? '') : $token;
+    return hash_hmac('sha256', 'mirza-telegram-webhook-v1', (string) $token);
+}
+function webhook_state_path($token = null)
+{
+    $cacheDir = __DIR__ . '/storage/cache';
+    if (!is_dir($cacheDir) && !@mkdir($cacheDir, 0775, true) && !is_dir($cacheDir)) {
+        return null;
+    }
+    // One state file per bot token (main bot and every reseller bot).
+    return $cacheDir . '/webhook_' . substr(hash('sha256', 'state' . webhook_secret_token($token)), 0, 20) . '.json';
+}
+function webhook_state_read($token = null)
+{
+    $state = ['confirmed' => false, 'last_attempt' => 0];
+    $path = webhook_state_path($token);
+    if ($path !== null && is_file($path)) {
+        $data = json_decode((string) @file_get_contents($path), true);
+        if (is_array($data)) {
+            $state = array_merge($state, $data);
+        }
+    }
+    return $state;
+}
+function webhook_state_write(array $state, $token = null)
+{
+    $path = webhook_state_path($token);
+    if ($path === null) {
+        return false;
+    }
+    return @file_put_contents($path, json_encode($state), LOCK_EX) !== false;
+}
+function register_webhook_secret($token = null)
+{
+    $state = webhook_state_read($token);
+    if (time() - intval($state['last_attempt']) < 600) {
+        return false;
+    }
+    $state['last_attempt'] = time();
+    if (!webhook_state_write($state, $token)) {
+        // Without persisted state the calls could not be rate limited.
+        return false;
+    }
+    $info = telegram('getWebhookInfo', [], $token);
+    if (!is_array($info) || empty($info['ok']) || empty($info['result']['url'])) {
+        return false;
+    }
+    $result = $info['result'];
+    if (!empty($result['has_custom_certificate'])) {
+        // A self-signed certificate cannot be re-sent from here; stay on the
+        // source-IP check so the bot keeps receiving updates.
+        $state['confirmed'] = false;
+        webhook_state_write($state, $token);
+        return false;
+    }
+    // Keep the current URL and delivery settings; only add the secret.
+    $params = [
+        'url' => $result['url'],
+        'secret_token' => webhook_secret_token($token),
+    ];
+    if (!empty($result['max_connections'])) {
+        $params['max_connections'] = intval($result['max_connections']);
+    }
+    if (isset($result['allowed_updates']) && is_array($result['allowed_updates'])) {
+        $params['allowed_updates'] = json_encode($result['allowed_updates']);
+    }
+    $response = telegram('setWebhook', $params, $token);
+    return is_array($response) && !empty($response['ok']);
+}
+function telegram_webhook_authorized($token = null)
+{
+    $provided = $_SERVER['HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN'] ?? '';
+    if (is_string($provided) && $provided !== '') {
+        if (hash_equals(webhook_secret_token($token), $provided)) {
+            $state = webhook_state_read($token);
+            if (empty($state['confirmed'])) {
+                $state['confirmed'] = true;
+                webhook_state_write($state, $token);
+            }
+            return true;
+        }
+        // Wrong secret (e.g. the bot token was rotated): register the current
+        // secret; Telegram retries the rejected update afterwards.
+        if (checktelegramip()) {
+            register_webhook_secret($token);
+        }
+        return false;
+    }
+    if (!checktelegramip()) {
+        return false;
+    }
+    $state = webhook_state_read($token);
+    if (!empty($state['confirmed'])) {
+        // The secret is known to work, so an update without it did not come
+        // through this bot's own webhook (or the webhook was reset). Register
+        // the secret again; Telegram retries the rejected update afterwards.
+        register_webhook_secret($token);
+        return false;
+    }
+    // Secret not active yet: keep the old source-IP behaviour and register it.
+    register_webhook_secret($token);
+    return true;
+}
+function cron_secret_token()
+{
+    global $APIKEY;
+    return hash_hmac('sha256', 'mirza-cron-v1', (string) ($APIKEY ?? ''));
+}
+function cron_guard()
+{
+    if (PHP_SAPI === 'cli') {
+        return;
+    }
+    $provided = $_GET['key'] ?? $_SERVER['HTTP_X_CRON_KEY'] ?? '';
+    if (is_string($provided) && $provided !== '' && hash_equals(cron_secret_token(), $provided)) {
+        return;
+    }
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    $serverIp = $_SERVER['SERVER_ADDR'] ?? '';
+    $local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+    if (in_array($ip, $local, true) || ($serverIp !== '' && $ip === $serverIp)) {
+        return;
+    }
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
+    exit('Forbidden');
+}
+#-----------per-user processing lock------------#
+// Serialises the handling of updates from the same Telegram user so that two
+// parallel taps cannot both pass a balance / limit check before either one
+// has written its result. The lock expires on its own (ttl) so a stuck
+// request can never lock a user out for long.
+function acquire_user_lock($userId, $waitSeconds = 10, $ttlSeconds = 120)
+{
+    global $pdo;
+    if (!($pdo instanceof PDO)) {
+        return true;
+    }
+    $key = 'u' . preg_replace('/[^0-9A-Za-z_-]/', '', (string) $userId);
+    $token = bin2hex(random_bytes(16));
+    $deadline = microtime(true) + $waitSeconds;
+    $tableReady = false;
+    while (true) {
+        $now = time();
+        try {
+            $stmt = $pdo->prepare("INSERT INTO user_lock (lock_key, token, expires) VALUES (:k, :t, :e)
+                ON DUPLICATE KEY UPDATE token = IF(expires < :now1, VALUES(token), token), expires = IF(expires < :now2, VALUES(expires), expires)");
+            $stmt->execute([':k' => $key, ':t' => $token, ':e' => $now + $ttlSeconds, ':now1' => $now, ':now2' => $now]);
+            $check = $pdo->prepare("SELECT token FROM user_lock WHERE lock_key = :k");
+            $check->execute([':k' => $key]);
+            if ($check->fetchColumn() === $token) {
+                register_shutdown_function(static function () use ($pdo, $key, $token) {
+                    try {
+                        $release = $pdo->prepare("DELETE FROM user_lock WHERE lock_key = :k AND token = :t");
+                        $release->execute([':k' => $key, ':t' => $token]);
+                    } catch (Throwable $e) {
+                        error_log('user lock release failed: ' . $e->getMessage());
+                    }
+                });
+                return true;
+            }
+        } catch (PDOException $e) {
+            if (!$tableReady && ($e->getCode() === '42S02' || stripos($e->getMessage(), "doesn't exist") !== false)) {
+                $tableReady = true;
+                try {
+                    $pdo->exec("CREATE TABLE IF NOT EXISTS user_lock (lock_key VARCHAR(100) PRIMARY KEY, token CHAR(32) NOT NULL, expires INT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+                    continue;
+                } catch (PDOException $createError) {
+                    error_log('user lock table unavailable: ' . $createError->getMessage());
+                    return true;
+                }
+            }
+            error_log('user lock unavailable: ' . $e->getMessage());
+            return true;
+        }
+        if (microtime(true) >= $deadline) {
+            return false;
+        }
+        usleep(250000);
+    }
+}
+function balance_add($userId, $amount)
+{
+    global $pdo;
+    $stmt = $pdo->prepare("UPDATE user SET Balance = Balance + :amount WHERE id = :id");
+    $stmt->execute([':amount' => $amount, ':id' => $userId]);
+    clearSelectCache('user');
+    return $stmt->rowCount() > 0;
+}
+// Amounts for extra volume / time travel in callback data as
+// "unit price x quantity". Accept only a whole, positive quantity at the
+// current unit price; returns the quantity or false.
+function extra_quantity_from_amount($amount, $unitPrice)
+{
+    if (!is_string($amount) && !is_int($amount)) {
+        return false;
+    }
+    $amount = (string) $amount;
+    if ($amount === '' || !ctype_digit($amount)) {
+        return false;
+    }
+    $unit = floatval($unitPrice);
+    if ($unit <= 0) {
+        return false;
+    }
+    $quantity = intval($amount) / $unit;
+    $rounded = round($quantity);
+    if ($rounded < 1 || abs($quantity - $rounded) > 0.000001) {
+        return false;
+    }
+    return (int) $rounded;
+}
+function user_owns_invoice($invoiceRow, $from_id)
+{
+    return is_array($invoiceRow)
+        && isset($invoiceRow['id_user'])
+        && (string) $invoiceRow['id_user'] === (string) $from_id;
+}
 function addCronIfNotExists($cronCommand)
 {
     $commands = is_array($cronCommand) ? $cronCommand : [$cronCommand];
@@ -1667,6 +1944,34 @@ function addCronIfNotExists($cronCommand)
         return $line !== '' && strpos($line, '#') !== 0;
     }));
 
+    $originalCronLines = $cronLines;
+    // When a new command targets a cronbot script, drop any pre-existing line
+    // that points to the same script (e.g. an older URL without the key) so we
+    // replace it instead of leaving a stale duplicate behind.
+    $scriptSignature = static function ($command) {
+        if (preg_match('#/cronbot/([A-Za-z0-9_]+\.php)#', (string) $command, $m)) {
+            return $m[1];
+        }
+        return null;
+    };
+    $incomingScripts = [];
+    foreach ($commands as $command) {
+        $sig = $scriptSignature($command);
+        if ($sig !== null) {
+            $incomingScripts[$sig] = true;
+        }
+    }
+    if (!empty($incomingScripts)) {
+        $cronLines = array_values(array_filter($cronLines, static function ($line) use ($scriptSignature, $incomingScripts, $commands) {
+            $sig = $scriptSignature($line);
+            if ($sig === null || !isset($incomingScripts[$sig])) {
+                return true;
+            }
+            // Keep the line only if it is exactly one of the new commands.
+            return in_array($line, $commands, true);
+        }));
+    }
+
     $newLineAdded = false;
     foreach ($commands as $command) {
         if (!in_array($command, $cronLines, true)) {
@@ -1675,7 +1980,7 @@ function addCronIfNotExists($cronCommand)
         }
     }
 
-    if (!$newLineAdded) {
+    if (!$newLineAdded && $cronLines === $originalCronLines) {
         return true;
     }
 
@@ -1702,28 +2007,54 @@ function addCronIfNotExists($cronCommand)
 
 function activecron()
 {
-    global $domainhosts;
+    global $domainhosts, $APIKEY;
+
+    // Shared secret appended to the cron URLs so only the server's own cron
+    // (which this function provisions) can trigger the cronbot scripts.
+    $key = cron_secret_token();
 
     $cronCommands = [
-        "*/15 * * * * curl https://$domainhosts/cronbot/statusday.php",
-        "*/1 * * * * curl https://$domainhosts/cronbot/croncard.php",
-        "*/1 * * * * curl https://$domainhosts/cronbot/NoticationsService.php",
-        "*/5 * * * * curl https://$domainhosts/cronbot/payment_expire.php",
-        "*/1 * * * * curl https://$domainhosts/cronbot/sendmessage.php",
-        "*/3 * * * * curl https://$domainhosts/cronbot/plisio.php",
-        "*/1 * * * * curl https://$domainhosts/cronbot/activeconfig.php",
-        "*/1 * * * * curl https://$domainhosts/cronbot/disableconfig.php",
-        "*/1 * * * * curl https://$domainhosts/cronbot/iranpay1.php",
-        "0 */5 * * * curl https://$domainhosts/cronbot/backupbot.php",
-        "*/2 * * * * curl https://$domainhosts/cronbot/gift.php",
-        "*/30 * * * * curl https://$domainhosts/cronbot/expireagent.php",
-        "*/15 * * * * curl https://$domainhosts/cronbot/on_hold.php",
-        "*/2 * * * * curl https://$domainhosts/cronbot/configtest.php",
-        "*/15 * * * * curl https://$domainhosts/cronbot/uptime_node.php",
-        "*/15 * * * * curl https://$domainhosts/cronbot/uptime_panel.php",
+        "*/15 * * * * curl https://$domainhosts/cronbot/statusday.php?key=$key",
+        "*/1 * * * * curl https://$domainhosts/cronbot/croncard.php?key=$key",
+        "*/1 * * * * curl https://$domainhosts/cronbot/NoticationsService.php?key=$key",
+        "*/5 * * * * curl https://$domainhosts/cronbot/payment_expire.php?key=$key",
+        "*/1 * * * * curl https://$domainhosts/cronbot/sendmessage.php?key=$key",
+        "*/3 * * * * curl https://$domainhosts/cronbot/plisio.php?key=$key",
+        "*/1 * * * * curl https://$domainhosts/cronbot/activeconfig.php?key=$key",
+        "*/1 * * * * curl https://$domainhosts/cronbot/disableconfig.php?key=$key",
+        "*/1 * * * * curl https://$domainhosts/cronbot/iranpay1.php?key=$key",
+        "0 */5 * * * curl https://$domainhosts/cronbot/backupbot.php?key=$key",
+        "*/2 * * * * curl https://$domainhosts/cronbot/gift.php?key=$key",
+        "*/30 * * * * curl https://$domainhosts/cronbot/expireagent.php?key=$key",
+        "*/15 * * * * curl https://$domainhosts/cronbot/on_hold.php?key=$key",
+        "*/2 * * * * curl https://$domainhosts/cronbot/configtest.php?key=$key",
+        "*/15 * * * * curl https://$domainhosts/cronbot/uptime_node.php?key=$key",
+        "*/15 * * * * curl https://$domainhosts/cronbot/uptime_panel.php?key=$key",
     ];
 
     addCronIfNotExists($cronCommands);
+}
+
+// activecron() runs when the admin opens the admin panel. An install upgraded
+// from a build whose cron lines carried no key would have its cron jobs refused
+// by cron_guard() until then (behind a CDN the request does not come from the
+// server's own address), so ordinary updates re-provision the lines as well,
+// at most once a day.
+function ensure_cron_keys()
+{
+    $cacheDir = __DIR__ . '/storage/cache';
+    if (!is_dir($cacheDir) && !@mkdir($cacheDir, 0775, true) && !is_dir($cacheDir)) {
+        return;
+    }
+    $stamp = $cacheDir . '/cron_' . substr(hash('sha256', 'cron' . cron_secret_token()), 0, 20) . '.json';
+    if (is_file($stamp) && time() - intval(@filemtime($stamp)) < 86400) {
+        return;
+    }
+    // Without the stamp the call could not be rate limited.
+    if (@file_put_contents($stamp, json_encode(['at' => time()]), LOCK_EX) === false) {
+        return;
+    }
+    activecron();
 }
 
 function inlineFixer($str, int $count_button = 1)

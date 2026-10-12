@@ -61,9 +61,19 @@ if (!is_array($data)) {
 }
 
 $data = sanitize_recursive($data);
-$tokencheck = explode('Bearer ', $headers['Authorization'])[1];
+$authorizationHeader = '';
+foreach ($headers as $headerName => $headerValue) {
+    if (strcasecmp($headerName, 'Authorization') === 0) {
+        $authorizationHeader = (string) $headerValue;
+        break;
+    }
+}
+$tokencheck = '';
+if (stripos($authorizationHeader, 'Bearer ') === 0) {
+    $tokencheck = trim(substr($authorizationHeader, 7));
+}
 $usercheck = select('user', "*", "id", $data['user_id'], "select");
-if ($usercheck['User_Status'] == "block") {
+if ($usercheck && $usercheck['User_Status'] == "block") {
     echo json_encode([
         'status' => false,
         'msg' => "user blocked",
@@ -74,7 +84,7 @@ if ($usercheck['User_Status'] == "block") {
 $errorreport = select("topicid", "idreport", "report", "errorreport", "select")['idreport'];
 $porsantreport = select("topicid", "idreport", "report", "porsantreport", "select")['idreport'];
 $buyreport = select("topicid", "idreport", "report", "buyreport", "select")['idreport'];
-if (!$usercheck || $usercheck['token'] != $tokencheck) {
+if (!$usercheck || $tokencheck === '' || empty($usercheck['token']) || !hash_equals((string) $usercheck['token'], $tokencheck)) {
     echo json_encode([
         'status' => false,
         'msg' => "Token invalid",
@@ -98,16 +108,24 @@ switch ($data['actions']) {
         $username = $data['q'];
         $offset = ($page - 1) * $limit;
         if ($username != null) {
-            $querywhere = " AND username LIKE '%$username%'";
+            $querywhere = " AND username LIKE :search";
+            $searchLike = '%' . $username . '%';
         } else {
             $querywhere = "";
         }
-        $countStmt = $pdo->prepare("SELECT COUNT(*) as total FROM invoice WHERE id_user = '$user_id' AND (status = 'active' OR status = 'end_of_time'  OR status = 'end_of_volume' OR status = 'sendedwarn' OR Status = 'send_on_hold') $querywhere");
+        $countStmt = $pdo->prepare("SELECT COUNT(*) as total FROM invoice WHERE id_user = :user_id AND (status = 'active' OR status = 'end_of_time'  OR status = 'end_of_volume' OR status = 'sendedwarn' OR Status = 'send_on_hold') $querywhere");
+        $countStmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+        if ($username != null) {
+            $countStmt->bindValue(':search', $searchLike, PDO::PARAM_STR);
+        }
         $countStmt->execute();
         $totalItems = $countStmt->fetchColumn();
         $totalPages = ceil($totalItems / $limit);
         $stmt = $pdo->prepare("SELECT username,note,Service_location FROM invoice WHERE id_user = :user_id AND (status = 'active' OR status = 'end_of_time'  OR status = 'end_of_volume' OR status = 'sendedwarn' OR Status = 'send_on_hold') $querywhere  ORDER BY time_sell DESC LIMIT :limit OFFSET :offset ");
         $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+        if ($username != null) {
+            $stmt->bindValue(':search', $searchLike, PDO::PARAM_STR);
+        }
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
         $stmt->execute();
@@ -599,11 +617,19 @@ switch ($data['actions']) {
                     ]);
                     return;
                 }
-                $category_remarks = "AND category = '{$category_remark['remark']}'";
+                $category_remarks = "AND category = :category_remark";
                 $selected_category_id = $category_remark['id'];
             }
-            $time_range_day = $data['time_range_day'] == 0 ? "" : "AND Service_time = '{$data['time_range_day']}'";
-            $stmt = $pdo->prepare("SELECT * FROM product WHERE (Location = '{$panel['name_panel']}' OR Location = '/all')AND agent= '{$user_info['agent']}' $category_remarks $time_range_day");
+            $time_range_day = $data['time_range_day'] == 0 ? "" : "AND Service_time = :time_range_day";
+            $stmt = $pdo->prepare("SELECT * FROM product WHERE (Location = :panel_name OR Location = '/all')AND agent= :agent $category_remarks $time_range_day");
+            $stmt->bindValue(':panel_name', $panel['name_panel'], PDO::PARAM_STR);
+            $stmt->bindValue(':agent', $user_info['agent'], PDO::PARAM_STR);
+            if ($category_remarks !== "") {
+                $stmt->bindValue(':category_remark', $category_remark['remark'], PDO::PARAM_STR);
+            }
+            if ($data['time_range_day'] != 0) {
+                $stmt->bindValue(':time_range_day', $data['time_range_day'], PDO::PARAM_STR);
+            }
             $stmt->execute();
             $product_list = [];
             while ($result = $stmt->fetch(PDO::FETCH_ASSOC)) {
@@ -727,11 +753,66 @@ switch ($data['actions']) {
             return;
         }
         $user_info = select("user", "*", "token", $tokencheck, "select");
+        if (!$user_info) {
+            http_response_code(403);
+            echo json_encode(array(
+                'status' => false,
+                'msg' => "Token invalid"
+            ));
+            return;
+        }
+        // The same panel rules the "countries" listing applies: a panel that is
+        // reserved for another user group, or hidden from this user, can not be
+        // bought from by crafting the request directly.
+        $panelHiddenUsers = $panel['hide_user'] != null ? json_decode($panel['hide_user'], true) : [];
+        if (!is_array($panelHiddenUsers)) {
+            $panelHiddenUsers = [];
+        }
+        if (($panel['agent'] != $user_info['agent'] && $panel['agent'] != 'all') || in_array($user_info['id'], $panelHiddenUsers)) {
+            http_response_code(500);
+            echo json_encode(array(
+                'status' => false,
+                'msg' => "پنل انتخابی موجود نیست."
+            ));
+            return;
+        }
         $usernameinvoice = select("invoice", "username", null, null, "FETCH_COLUMN");
         if (empty($data['custom_service'])) {
             $product = select("product", "*", "code_product", $data['service_id'], "select");
+            if (!empty($product)) {
+                // Only products that the "services" listing would offer this user
+                // for this panel: same user group (agent price list), same
+                // location, not hidden on the panel, and the one-time-buy rule.
+                $productHidden = json_decode($product['hide_panel'], true);
+                if (!is_array($productHidden)) {
+                    $productHidden = [];
+                }
+                $productAllowed = $product['agent'] == $user_info['agent']
+                    && ($product['Location'] == $panel['name_panel'] || $product['Location'] == '/all')
+                    && !in_array($panel['name_panel'], $productHidden);
+                if ($productAllowed && $product['one_buy_status'] == "1") {
+                    $oneBuyStmt = $pdo->prepare("SELECT COUNT(*) FROM invoice WHERE Status != 'Unpaid' AND id_user = :id_user");
+                    $oneBuyStmt->execute([':id_user' => $user_info['id']]);
+                    if ((int) $oneBuyStmt->fetchColumn() != 0) {
+                        $productAllowed = false;
+                    }
+                }
+                if (!$productAllowed) {
+                    $product = null;
+                }
+            }
         } else {
             $statuscustomvolume = json_decode($panel['customvolume'], true)[$user_info['agent']];
+            if (intval($statuscustomvolume) != 1 || $panel['type'] == "Manualsale" || !is_array($data['custom_service'])) {
+                http_response_code(500);
+                echo json_encode(array(
+                    'status' => false,
+                    'msg' => "محصول انتخابی پیدا نشد"
+                ));
+                return;
+            }
+            $data['custom_service']['traffic_gb'] = intval($data['custom_service']['traffic_gb'] ?? 0);
+            $data['custom_service']['time_days'] = intval($data['custom_service']['time_days'] ?? 0);
             $mainvolume = json_decode($panel['mainvolume'], true);
             $mainvolume = $mainvolume[$user_info['agent']];
             $maxvolume = json_decode($panel['maxvolume'], true);
@@ -791,6 +872,17 @@ switch ($data['actions']) {
             ));
             return;
         }
+        if ($panel['MethodUsername'] == $textbotlang['users']['customusername'] || $panel['MethodUsername'] == "نام کاربری دلخواه + عدد رندوم") {
+            // same rule the bot applies to a custom service username
+            if (!is_string($data['custom_username'] ?? null) || !preg_match('~(?!_)^[a-z][a-z\d_]{2,32}(?<!_)$~i', $data['custom_username'])) {
+                http_response_code(500);
+                echo json_encode(array(
+                    'status' => false,
+                    'msg' => "نام کاربری نامعتبر است"
+                ));
+                return;
+            }
+        }
         $randomString = bin2hex(random_bytes(4));
         $username_ac = generateUsername($user_info['id'], $panel['MethodUsername'], $user_info['username'], $randomString, $data['custom_username'], $panel['namecustom'], $user_info['namecustom']);
         $username_ac = strtolower($username_ac);
@@ -802,6 +894,27 @@ switch ($data['actions']) {
                 'msg' => "نام کاربری وجود دارد مراحل را از اول طی کنید"
             ));
             return;
+        }
+        // Reserve the price atomically before creating the service so that two
+        // concurrent purchases cannot both spend the same balance.
+        $balanceReserved = false;
+        if (intval($product['price_product']) != 0) {
+            $reserveStmt = $pdo->prepare("UPDATE user SET Balance = Balance - :price WHERE id = :id AND Balance >= :price_check");
+            $reserveStmt->execute([
+                ':price' => $product['price_product'],
+                ':id' => $user_info['id'],
+                ':price_check' => $product['price_product'],
+            ]);
+            clearSelectCache('user');
+            if ($reserveStmt->rowCount() !== 1) {
+                http_response_code(500);
+                echo json_encode(array(
+                    'status' => false,
+                    'msg' => "موجودی کمتر از قیمت محصول است"
+                ));
+                return;
+            }
+            $balanceReserved = true;
         }
         $notifctions = json_encode(array(
             'volume' => false,
@@ -829,6 +942,12 @@ switch ($data['actions']) {
         );
         $dataoutput = $ManagePanel->createUser($panel['name_panel'], $product['code_product'], $username_ac, $datac);
         if ($dataoutput['username'] == null) {
+            if ($balanceReserved) {
+                // service was not created: give the reserved amount back
+                $refundStmt = $pdo->prepare("UPDATE user SET Balance = Balance + :price WHERE id = :id");
+                $refundStmt->execute([':price' => $product['price_product'], ':id' => $user_info['id']]);
+                clearSelectCache('user');
+            }
             http_response_code(500);
             echo json_encode(array(
                 'status' => false,
@@ -874,10 +993,7 @@ switch ($data['actions']) {
         $textcreatuser = str_replace('{links}', $config, $textcreatuser);
         $textcreatuser = str_replace('{links2}', $output_config_link, $textcreatuser);
         sendMessageService($panel, $dataoutput['configs'], $output_config_link, $user_info['username'], null, $textcreatuser, $randomString, $user_info['id'], $image = '../images.jpg');
-        if (intval($product['price_product']) != 0) {
-            $Balance_prim = $user_info['Balance'] - $product['price_product'];
-            update("user", "Balance", $Balance_prim, "id", $user_info['id']);
-        }
+        // the price was already deducted atomically before the service was created
         if ($panel['MethodUsername'] == "متن دلخواه + عدد ترتیبی" || $panel['MethodUsername'] == "نام کاربری + عدد به ترتیب" || $panel['MethodUsername'] == "آیدی عددی+عدد ترتیبی" || $panel['MethodUsername']  == "متن دلخواه نماینده + عدد ترتیبی") {
             $value  = intval($user_info['number_username']) + 1;
             update("user", "number_username", $value, "id", $user_info['id']);

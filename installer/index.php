@@ -5,6 +5,24 @@ $rootDirectory = dirname(__DIR__).'/';
 
 $configDirectory = $rootDirectory.'config.php';
 $tablesDirectory = $rootDirectory.'table.php';
+
+// Once the bot has been configured, config.php no longer contains the
+// installation placeholders. Refuse to run the installer again so it cannot be
+// used to overwrite the live configuration (database credentials, bot token)
+// or silently re-point the Telegram webhook.
+$installerConfigRaw = @file_get_contents($configDirectory);
+$alreadyInstalled = $installerConfigRaw !== false
+    && strpos($installerConfigRaw, '{API_KEY}') === false
+    && strpos($installerConfigRaw, '{database_name}') === false;
+if ($alreadyInstalled) {
+    http_response_code(403);
+    echo '<!DOCTYPE html><html dir="rtl" lang="fa"><head><meta charset="UTF-8">'
+        . '<title>نصب انجام شده</title></head><body style="font-family:sans-serif;text-align:center;padding:40px">'
+        . '<h2>⛔️ ربات قبلاً نصب شده است</h2>'
+        . '<p>برای امنیت، اجرای مجدد نصب‌کننده غیرفعال است. در صورت نیاز به نصب دوباره، پوشه installer را حذف کرده و فایل config.php را به حالت اولیه بازگردانید.</p>'
+        . '</body></html>';
+    exit;
+}
 if(!file_exists($configDirectory) || !file_exists($tablesDirectory)) {
     $ERROR[] = "فایل های پروژه ناقص هستند.";
     $ERROR[] = "فایل های پروژه را مجددا دانلود و بارگذاری کنید (<a href='https://github.com/mahdiMGF2/mirza_pro'>‎🌐 Github</a>)";

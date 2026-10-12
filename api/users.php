@@ -140,13 +140,17 @@ switch ($data['actions'] ?? '') {
         $page = isset($data['page']) && is_numeric($data['page']) ? max((int) $data['page'], 1) : 1;
         $offset = ($page - 1) * $limit;
         $q = isset($data['q']) ? $data['q'] : '';
-        $agent_type = isset($data['agent']) ? " AND agent = '{$data['agent']}'" : '';
+        $hasAgentFilter = isset($data['agent']);
+        $agent_type = $hasAgentFilter ? " AND agent = :agent" : '';
 
         try {
             $stmt = $pdo->prepare("SELECT COUNT(*) as total FROM user WHERE (id LIKE :id_user OR username LIKE :username) $agent_type");
             $search = "%$q%";
             $stmt->bindParam(':id_user', $search, PDO::PARAM_STR);
             $stmt->bindParam(':username', $search, PDO::PARAM_STR);
+            if ($hasAgentFilter) {
+                $stmt->bindValue(':agent', $data['agent'], PDO::PARAM_STR);
+            }
             $stmt->execute();
             $totalUsers = (int) $stmt->fetchColumn();
             $totalPages = ceil($totalUsers / $limit);
@@ -154,6 +158,9 @@ switch ($data['actions'] ?? '') {
             $stmt = $pdo->prepare($query);
             $stmt->bindValue(':username', $q, PDO::PARAM_STR);
             $stmt->bindValue(':user_id', $q, PDO::PARAM_INT);
+            if ($hasAgentFilter) {
+                $stmt->bindValue(':agent', $data['agent'], PDO::PARAM_STR);
+            }
             $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
             $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
             $stmt->execute();

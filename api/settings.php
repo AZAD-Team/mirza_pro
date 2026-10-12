@@ -156,6 +156,11 @@ switch ($data['actions'] ?? '') {
             if (empty($data['data']))
                 sendJsonResponse(false, "data empty ", [], 200);
             foreach ($data['data'] as $setting) {
+                if (!isset($setting['name_value']) || !preg_match('/^[A-Za-z0-9_]+$/', (string) $setting['name_value'])) {
+                    // name_value is used as a column identifier; reject anything
+                    // that is not a plain identifier to prevent SQL injection.
+                    continue;
+                }
                 if (!empty(($setting['json'])) && $setting['json'])
                     $setting['value'] = json_encode($setting['value']);
                 if ($setting['type'] == "shop") {

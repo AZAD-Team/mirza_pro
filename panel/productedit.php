@@ -1,4 +1,5 @@
 <?php
+if(!function_exists("mirza_panel_session_cookie")){function mirza_panel_session_cookie(){$sp=(!empty($_SERVER["HTTPS"])&&$_SERVER["HTTPS"]!=="off")||(($_SERVER["HTTP_X_FORWARDED_PROTO"]??"")==="https");if(PHP_VERSION_ID>=70300){@session_set_cookie_params(["lifetime"=>0,"path"=>"/","httponly"=>true,"secure"=>$sp,"samesite"=>"Lax"]);}else{@ini_set("session.cookie_httponly","1");if($sp){@ini_set("session.cookie_secure","1");}}}}mirza_panel_session_cookie();
 session_start();
 require_once __DIR__ . '/../config.php'; 
 require_once __DIR__ . '/../function.php'; 

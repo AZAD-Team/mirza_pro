@@ -119,6 +119,18 @@ function validate_telegram_init_data($rawData, string $botToken): array
         throw new RuntimeException('User verification failed');
     }
 
+    // Reject stale init data so a captured payload cannot be replayed forever to
+    // mint fresh session tokens. Telegram provides a fresh auth_date on every
+    // mini app launch, so a generous window does not affect normal use.
+    $authDate = isset($initData['auth_date']) ? (int) $initData['auth_date'] : 0;
+    if ($authDate <= 0) {
+        throw new RuntimeException('User verification failed');
+    }
+    $maxAgeSeconds = 86400;
+    if (abs(time() - $authDate) > $maxAgeSeconds) {
+        throw new RuntimeException('User verification failed');
+    }
+
     $userRaw = $initData['user'] ?? null;
     if (is_string($userRaw)) {
         $userData = json_decode($userRaw, true);

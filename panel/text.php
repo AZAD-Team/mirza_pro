@@ -1,4 +1,5 @@
 <?php
+if(!function_exists("mirza_panel_session_cookie")){function mirza_panel_session_cookie(){$sp=(!empty($_SERVER["HTTPS"])&&$_SERVER["HTTPS"]!=="off")||(($_SERVER["HTTP_X_FORWARDED_PROTO"]??"")==="https");if(PHP_VERSION_ID>=70300){@session_set_cookie_params(["lifetime"=>0,"path"=>"/","httponly"=>true,"secure"=>$sp,"samesite"=>"Lax"]);}else{@ini_set("session.cookie_httponly","1");if($sp){@ini_set("session.cookie_secure","1");}}}}mirza_panel_session_cookie();
 session_start();
 require_once __DIR__ . '/../config.php';
 
@@ -7,14 +8,15 @@ $query->bindParam("username", $_SESSION["user"], PDO::PARAM_STR);
 $query->execute();
 $result = $query->fetch(PDO::FETCH_ASSOC);
 
-if($_GET['action'] == "save"){
-    update("x_ui", "setting", $_POST['settings'], "codepanel", $_POST['namepanel']);
-    header('Location: seeting_x_ui.php');
-}
-
 if(!isset($_SESSION["user"]) || !$result){
     header('Location: login.php');
-    return;
+    exit;
+}
+
+if(($_GET['action'] ?? '') == "save"){
+    update("x_ui", "setting", $_POST['settings'] ?? '', "codepanel", $_POST['namepanel'] ?? '');
+    header('Location: seeting_x_ui.php');
+    exit;
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $jsonData = file_get_contents('php://input');

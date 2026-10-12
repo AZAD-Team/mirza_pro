@@ -1489,5 +1489,6 @@ $connect->query("ALTER TABLE marzban_panel MODIFY name_panel VARCHAR(255) COLLAT
 $connect->query("ALTER TABLE product MODIFY name_product VARCHAR(255) COLLATE utf8mb4_bin");
 $connect->query("ALTER TABLE help MODIFY name_os VARCHAR(500) COLLATE utf8mb4_bin");
 telegram('setwebhook', [
-    'url' => "https://$domainhosts/index.php"
+    'url' => "https://$domainhosts/index.php",
+    'secret_token' => webhook_secret_token()
 ]);

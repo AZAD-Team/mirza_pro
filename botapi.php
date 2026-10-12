@@ -229,7 +229,7 @@ function isDuplicateUpdate($updateId)
 // #-----------------------------#
 $update = json_decode(file_get_contents("php://input"), true);
 $update_id = $update['update_id'] ?? 0;
-if (isDuplicateUpdate($update_id)) {
+if (!defined('MIRZA_DEFER_UPDATE_DEDUPE') && isDuplicateUpdate($update_id)) {
     http_response_code(200);
     exit;
 }
